@@ -1,0 +1,159 @@
+## sample of the LiveEventsController - utilizes Juggernaut and node.js for real-time chat
+
+class LiveEventsController < ApplicationController
+  before_filter :authenticate_user!
+  load_and_authorize_resource
+  
+  # broadcast page
+  #   -page to broadcast a guru's live event
+  #
+  # * *Args*    :
+  #   - +event_id+ -> ID of the live event
+  # * *Returns* :
+  #   - Event Page
+  #
+  def broadcast
+    @event = LiveEvent.find(params[:live_event_id])
+    if !@event or @event.end_date < DateTime.now
+      @event.destroy if @event
+      redirect_to dashboard_users_path, :alert => 'This event has ended.'
+      return
+    end
+    if @event.chat_id.blank?
+      @event.update_attribute(:chat_id, Digest::MD5.hexdigest(Time.now.to_s+@event.id.to_s))
+    end
+    if @event.channel_id.blank?
+      gon.channel_listener = 'channel_'+@event.chat_id
+    end
+    gon.chat_id = @event.chat_id
+    @hostname = request.host
+  end
+  
+  # set_channel_id action
+  #   -to set your broadcast channel as the event guru
+  #
+  # * *Args*    :
+  #   - +event_id+ -> Event ID
+  #   - +channel_id+ -> uStream channel ID
+  #   - +channel_listener+ -> channel ID to update waiting users
+  # * *Returns* :
+  #   - json response of 1
+  #
+  def set_channel_id
+    @event = LiveEvent.find(params[:live_event_id])
+    @event.update_attribute(:channel_id, params[:channel_id])
+    data = { :channel_id => params[:channel_id] }
+    Juggernaut.publish(params[:channel_listener], data.to_json)
+    render :json => 1
+  end
+  
+  # send_chat action
+  #   -to relay a chat message to the broadcast page
+  #
+  # * *Args*    :
+  #   - +message+ -> Message to be sent
+  #   - +channel+ -> WurqoutSession Juggernaut channel
+  # * *Returns* :
+  #   - json response of 1
+  #
+  def send_chat
+    chat_line = { :uid => current_user.id, :uname => current_user.username, :msg => params[:message] }
+    Juggernaut.publish(params[:channel], chat_line.to_json)
+    render :json => 1
+  end
+end
+
+## sample of the WurqoutSession Model
+
+class WurqoutSession < ActiveRecord::Base
+  belongs_to :guru, :class_name => :User
+  belongs_to :wurqer, :class_name => :User
+  has_one :payment
+  has_many :wurqout_session_notes
+  has_many :wurqout_session_logs
+  
+  validate :guru_availability
+  
+  attr_accessible :cost, :guru_id, :wurqer_id, :wurqout_level, :session_type, :start_date, :end_date, :old_start_date, :status, :payment_status, :notes, :cancelled_by, :wurqer_rating
+  
+  # guru_availability validation
+  #   -to double-check the availability of a Guru when creating and updating a wurqout session
+  #
+  def guru_availability
+    if self.start_date > DateTime.now + 2.weeks
+      errors[:base] << 'You can only schedule up to 2 weeks in advance.'
+      return
+    end
+    @guru = User.find(self.guru_id)
+    if @guru.guru_scheduled_availabilities.select{|a| self.start_date >= a.start_date and self.end_date <= a.end_date}.blank?
+      if @guru.guru_recurring_availabilities.select{|a| a.weekday == self.start_date.in_time_zone(self.guru.timezone).wday and self.start_date >= DateTime.parse(self.start_date.in_time_zone(self.guru.timezone).strftime('%F')+' '+a.start_time.in_time_zone(self.guru.timezone).strftime('%T%z')) and self.end_date <= DateTime.parse((self.end_date + ( a.end_time.in_time_zone(self.guru.timezone).strftime('%D') != a.start_time.in_time_zone(self.guru.timezone).strftime('%D') ? 1 : 0).days).in_time_zone(self.guru.timezone).strftime('%F')+' '+a.end_time.in_time_zone(self.guru.timezone).strftime('%T%z'))}.blank?
+        errors[:base] << 'The timeframe is unavailable to the guru.'
+        return
+      end
+    end
+    if !@guru.guru_wurqout_sessions.select{|a| a.payment_status == 'paid' and a.id != (self.id || 0) and ((a.start_date >= self.start_date and a.start_date <= self.end_date) or (a.end_date >= self.start_date and a.end_date <= self.end_date)) }.blank?
+      errors[:base] << 'The timeframe is unavailable to the guru.'
+    end
+  end
+  
+  # get_max_points function
+  #   -to retrieve the max allowed point to award a wurqout session's wurqer
+  #
+  def get_max_points
+    points = 100
+    case self.wurqout_level
+    when "intermediate"
+        points = 300
+    when "advanced"
+        points = 500
+    when "hardcore"
+        points = 1000
+    end
+    return points
+  end
+  
+  # issue_refund function
+  #   -to refund the wurqout session's cost to the wurqer by an admin
+  # * *Returns* :
+  #   - refund transaction response on success
+  # * *Raises* :
+  #   - +returns false+ -> if the refund transaction fails
+  #   - +returns 'already refunded'+ -> if the payment has already been refunded
+  #
+  def issue_refund
+    payment = self.payment
+    if !payment.refunded
+      if !Rails.env.production?
+        ActiveMerchant::Billing::Base.mode = :test
+      end
+      transaction = ActiveMerchant::Billing::AuthorizeNetGateway.new(
+        :login    => User::API_LOGIN,
+        :password => User::API_KEY
+      )
+    
+      response = transaction.void( payment.transaction_id )
+
+      if !response.success?
+        Rails.logger.info(response.inspect)
+        response = transaction.refund(
+          payment.amount * 100,
+          payment.transaction_id,
+          :card_number => payment.card_no
+        )
+      end
+    
+      if response.success?
+        payment.update_attributes({:refunded => true})
+        self.status = 'cancelled_refunded'
+        self.save
+        return response
+      else
+        Rails.logger.info(response.inspect)
+        return false
+      end
+    else
+      return 'already refunded'
+    end
+  end
+  
+end
